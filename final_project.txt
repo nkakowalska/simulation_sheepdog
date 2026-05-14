@@ -1,0 +1,552 @@
+/**
+* Name: Sheep Herding with Sheepdog
+* Author: Weronika Kowalska
+* Description: Reynolds' boids flocking model (Author: Gudrun WALLENTIN, University of Salzburg)
+* with sheepdog herding behavior.
+*/
+
+model pasture801
+
+global torus: false {
+// ===== SIMULATION PARAMETERS =====
+// Sheep population
+int number_of_sheep <- 120 min: 3 max: 120;
+// dog polulation
+int number_of_dogs <- 2 min: 1 max: 2;
+
+// Flocking behavior parameters
+float min_separation <- 1.0 min: 0.1 max: 10.0;
+int max_separate_turn <- 5 min: 0 max: 20;
+int max_cohere_turn <- 15 min: 0 max: 20;
+int max_align_turn <- 15 min: 0 max: 20;
+
+// Vision ranges
+float vision <- 40.0 min: 0.0 max: 70.0;
+float flock_vision <- 150.0;
+float sheep_vision_for_dog <- 30.0;
+
+// Dog behavior parameters
+float big_dog_vision <- 120.0;
+float small_dog_vision <- 45.0;
+float dogs_vision_for_dogs <- 50.0;
+float whole_pasture_vision <- 900.0;
+float dog_speed <- 4.0;
+float herding_radius <- 45.0; // Radius of semi-circle movement
+
+// Gate parameters
+float gate_area_width <- 3.0; //Area of sheep recognizing the enterance
+float gate_width <- 1.0; // Width of the gate entrance
+point gate_center <- {132, 104}; // Center point of the gate
+
+// ===== STATISTICS TRACKING =====
+int sheep_entered_count <- 0;
+float total_herding_time <- 0.0;
+list<float> flock_compactness_history;
+list<float> dog_sheep_distance_history;
+list<int> sheep_in_fence_history;
+float average_flock_speed <- 0.0;
+float avg_distance;
+
+// ===== ENVIRONMENT FILES =====
+file gate_file <- file("../files_pasture/gate.shp");
+file pasture_open_file <- file("../files_pasture/sheep_pasture.shp");
+file fanced_area_file <- file("../files_pasture/fanced_area.shp");
+file sheep_poly_file <- file("../files_pasture/sheep_poly.shp");
+
+// ===== GEOMETRIES =====
+geometry gate_line <- geometry(gate_file);
+geometry pasture_open_polygon <- geometry(pasture_open_file);
+geometry fanced_area_polygon <- geometry(fanced_area_file);
+geometry sheep_poly_polygon <- geometry(sheep_poly_file);
+
+// Gate entrance zone (buffer around gate for sheep to pass through)
+geometry gate_entrance <- gate_line buffer gate_width; 
+geometry gate_area <- gate_line buffer gate_area_width;
+
+geometry shape <- envelope(pasture_open_file, fanced_area_file, gate_file);
+
+// ===== INITIALIZATION =====
+init {
+	// Create sheep in starting area
+	create sheep number: number_of_sheep {
+	location <- any_location_in(sheep_poly_polygon);
+	}
+
+	// Create sheepdog
+	create dogs number: number_of_dogs {
+	location <- {rnd(40, 45), rnd(180, 190)};
+	}
+}
+	
+// ===== GLOBAL STATISTICS UPDATE =====
+	reflex update_statistics {
+		sheep_entered_count <- sheep count (each.is_in_fence);
+		add sheep_entered_count to: sheep_in_fence_history;
+		
+		// Calculate flock compactness
+		list<sheep> active_sheep <- sheep where (!each.is_in_fence);
+		if (!empty(active_sheep)) {
+			avg_distance <- mean(active_sheep collect (
+				distance_to(each.location, mean(active_sheep collect each.location))
+			));
+			add avg_distance to: flock_compactness_history;
+			
+			// Average sheep speed
+			average_flock_speed <- mean(active_sheep collect each.speed);
+		}
+		
+		// Dog-flock distance
+		if (!empty(dogs) and !empty(active_sheep)) {
+			dogs dog <- first(dogs);
+			point flock_center <- {
+				mean(active_sheep collect each.location.x),
+				mean(active_sheep collect each.location.y)
+			};
+			add distance_to(dog.location, flock_center) to: dog_sheep_distance_history;
+		}
+		
+		total_herding_time <- total_herding_time + step;
+	}
+	
+	// ===== EXPORT STATISTICS =====
+	reflex export_stats{ 
+		save [
+			cycle,
+			number_of_dogs,
+			sheep_entered_count,
+			total_herding_time
+		] to: "../results/statistics.csv" format: "csv" rewrite: false;
+	}
+}
+
+// ===== SHEEP SPECIES =====
+species sheep skills: [moving] {
+	// Visual attributes
+	rgb colour <- #black;
+	
+	// Movement attributes
+	float sheep_normal_speed <- 1.0;
+	float sheep_panic_speed <- sheep_normal_speed+ 0.5;
+	point my_destination;
+	bool is_in_fence <- false; // Track if sheep has entered through gate
+	
+	// Flocking variables
+	list<sheep> flockmates;
+	sheep nearest_neighbour;
+	
+	// Dog awareness
+	list<dogs> dogs_in_vision;
+	float flee_direction;
+	point running_away_point;
+
+// ===== FLOCKING BEHAVIOR =====
+reflex flock {
+	// If all flocking parameters are zero, just wander
+	if (max_separate_turn = 0 and max_cohere_turn = 0 and max_align_turn = 0) {
+		do wander amplitude: 90.0 speed: sheep_normal_speed bounds: pasture_open_polygon;
+	}
+	
+	// Find nearby flockmates
+	do find_flockmates;
+	
+	// Apply flocking rules if there are flockmates nearby
+	if (not empty(flockmates)) {
+		do find_nearest_neighbour;
+	
+	if (distance_to(self, nearest_neighbour) < min_separation) {
+		do separate;
+		} 
+	else {
+		do align;
+		do cohere;
+		}
+	}
+
+	// Add some random wandering based on location
+	if (is_in_fence) {
+		do move heading: towards(self.location, {rnd(260,280),rnd(10,30)});
+	}
+	else{
+		do wander amplitude: 90.0 speed: sheep_normal_speed bounds: pasture_open_polygon;
+	}
+}
+
+// ===== ESCAPE FROM DOG =====
+reflex run_away_from_dog {
+	if (self.is_in_fence = false) {
+		do find_dog;
+
+	// If no dog nearby, do nothing
+	if (empty(dogs_in_vision)) {
+		return;
+		}
+
+	// Calculate flee direction (opposite to dog)
+	dogs dog <- dogs_in_vision[0];
+	flee_direction <- towards(dog.location, self.location); // Direction FROM dog TO sheep
+
+	// Update flockmates' destinations
+	ask flockmates {
+		my_destination <- {location.x + cos(heading), location.y + sin(heading)};
+		}
+
+	// Calculate escape point:
+	running_away_point <- self.location + {sheep_panic_speed * cos(flee_direction), sheep_panic_speed * sin(flee_direction)};
+
+	// Move toward escape point if it's in valid area
+	if (running_away_point intersects pasture_open_polygon) {
+		do goto speed: sheep_panic_speed target: running_away_point;
+		}
+	else if (running_away_point intersects fanced_area_polygon){
+
+		if (self.location intersects gate_entrance){
+			do goto speed: sheep_panic_speed target:running_away_point;
+			is_in_fence <- true;
+			}
+		else{
+			do move speed: sheep_panic_speed heading: - flee_direction bounds:pasture_open_polygon;
+			}
+		}
+	else {
+		return;
+		}
+	}
+}
+
+// ===== HELPER ACTIONS =====
+action find_dog {
+	dogs_in_vision <- (dogs overlapping (circle(sheep_vision_for_dog)));
+}
+
+action find_flockmates {
+	flockmates <- (((sheep overlapping (circle(vision))) - self) where (each.location intersects pasture_open_polygon));
+}
+
+action find_nearest_neighbour {
+	nearest_neighbour <- flockmates with_min_of(distance_to(self.location, each.location));
+}
+reflex gate_pulling{
+	if (self.location intersects gate_area and is_in_fence = false){
+		if (self.location intersects gate_entrance){
+			do move heading: towards(self.location, {gate_center.x, gate_center.y - 5});
+			is_in_fence <- true;
+		}else{
+			if (self.location.x > 135){
+				do move heading: towards(self.location, {138, 105}) bounds: pasture_open_polygon;
+			}else{
+				do move heading: towards(self.location, {126,105}) bounds: pasture_open_polygon;
+			}
+		}
+	}
+}
+
+// Separation: turn away from nearest neighbor
+action separate {
+	do turn_away(nearest_neighbour towards self, max_separate_turn);
+}
+
+// Alignment: match heading with flockmates
+action align {
+	float avg_head <- avg_mate_heading();
+	do turn_towards(avg_head, max_align_turn);
+}
+
+// Cohesion: move toward center of flockmates
+action cohere {
+	float avg_twds_mates <- avg_heading_towards_mates();
+	do turn_towards(avg_twds_mates, max_cohere_turn);
+}
+
+// ===== HEADING CALCULATIONS =====
+float avg_mate_heading {
+	ask flockmates {
+	my_destination <- {location.x + cos(heading), location.y + sin(heading)};
+	}
+
+	list<sheep> flockmates_insideShape <- flockmates where (each.my_destination != nil);
+	float x_component <- sum(flockmates_insideShape collect (each.my_destination.x - each.location.x));
+	float y_component <- sum(flockmates_insideShape collect (each.my_destination.y - each.location.y));
+
+	if (x_component = 0 and y_component = 0) {
+		return heading;
+	}
+
+	return -1 * atan2(x_component, y_component) + 90;
+}
+
+float avg_heading_towards_mates {
+	float x_component <- mean(flockmates collect (cos(towards(self.location, each.location))));
+	float y_component <- mean(flockmates collect (sin(towards(self.location, each.location))));
+
+	if (x_component = 0 and y_component = 0) {
+		return heading;
+	}
+
+	return -1 * atan2(x_component, y_component) + 90;
+}
+
+// ===== TURNING ACTIONS =====
+action turn_towards(float new_heading, int max_turn) {
+	float subtract_headings <- new_heading - heading;
+	if (subtract_headings < -180) {subtract_headings <- subtract_headings + 360;}
+	if (subtract_headings > 180) {subtract_headings <- subtract_headings - 360;}
+	do turn_at_most(subtract_headings, max_turn);
+}
+
+action turn_away(float new_heading, int max_turn) {
+	float subtract_headings <- heading - new_heading;
+	if (subtract_headings < -180) {subtract_headings <- subtract_headings + 360;}
+	if (subtract_headings > 180) {subtract_headings <- subtract_headings - 360;}
+	do turn_at_most(-1 * subtract_headings, max_turn);
+}
+
+action turn_at_most(float turn, int max_turn) {
+	if (abs(turn) > max_turn) {
+		if (turn > 0) {
+			heading <- heading + max_turn;
+		} else {
+			heading <- heading - max_turn;
+		}
+	} else {
+		heading <- heading + turn;
+	}
+}
+
+// ===== DISPLAY ASPECTS =====
+aspect sheep {
+	draw circle(speed) color: is_in_fence ? #white : #grey;
+	}
+
+aspect buffer {
+	draw circle(vision) color: #green;
+	}
+}
+
+// ===== DOG SPECIES =====
+species dogs skills: [moving] {
+// Dog attributes
+float size <- 5.5;
+list<dogs> other_dogs;
+dogs nearest_dog;
+int max_separate_turn_dog <- 60;
+
+// Flock tracking
+list<sheep> visible_flock;
+list<sheep> visible_flock_big;
+list<sheep> sheep_in_open_pasture;
+
+point flock_center;
+float flock_heading;
+float percentage_in_fence;
+point target_position;
+
+// Multi-dog coordination
+int dog_id <- int(self); // Unique ID for each dog
+float position_offset <- 10.0; // Offset angle for positioning relative to flock
+
+// Herding strategy
+float herding_angle <- 20.0; // Current angle in semi-circle
+float angle_increment <- 25.0; // Degrees to move per step
+bool moving_clockwise; 
+
+init {
+	// Assign different starting positions based on dog ID
+	position_offset <- (dog_id mod 2) * 90.0; // Dogs start on opposite sides
+	}
+
+// ===== FIND AND ANALYZE FLOCK =====
+reflex find_flock {
+	// Only count sheep that haven't entered the fence yet
+	sheep_in_open_pasture <- (sheep overlapping circle(whole_pasture_vision)) where (each.is_in_fence = false);
+	visible_flock <- (sheep overlapping circle(small_dog_vision)) where (each.is_in_fence = false);
+	visible_flock_big <- (sheep overlapping (circle(big_dog_vision))) where (each.is_in_fence = false);
+
+	// If the visible flock is too small, move toward larger groups
+	if (length(visible_flock) > 10) {
+		do calculate_flock_center(visible_flock);
+		do calculate_flock_heading(visible_flock);
+		do herd_sheep;
+	}
+	else{ 
+		if (length(visible_flock_big) >=10) {
+			do calculate_flock_center(visible_flock_big);
+			do calculate_flock_heading(visible_flock_big);
+			do herd_sheep;
+		} 
+		else{
+			// Search for remaining sheep in open pasture
+			if length(visible_flock) > 0{
+				do calculate_flock_center(visible_flock);
+				do calculate_flock_heading(visible_flock);
+				do herd_sheep;
+			}
+			else{
+				do move speed: dog_speed*2 heading: towards(self.location, one_of(sheep_in_open_pasture)) bounds: pasture_open_polygon;
+			}
+		}
+	}
+}
+
+action calculate_flock_center(list<sheep> flock) {
+	if (not empty(flock)){
+		float x_sum <- sum(flock collect each.location.x);
+		float y_sum <- sum(flock collect each.location.y);
+		flock_center <- {x_sum / length(flock), y_sum / length(flock)};
+	}
+}
+
+action calculate_flock_heading(list<sheep> flock) {
+	list<point> destinations;
+	ask flock {
+		add {location.x + cos(heading), location.y + sin(heading)} to: destinations;
+	}
+
+	float x_component <- mean(destinations collect (each.x - flock_center.x));
+	float y_component <- mean(destinations collect (each.y - flock_center.y));
+
+	if (x_component != 0 or y_component != 0) {
+		flock_heading <- -1 * atan2(x_component, y_component) + 90;
+	}
+}
+
+// ===== HERDING BEHAVIOR =====
+action herd_sheep {
+	// Calculate direction from flock center to gate
+	float target_bearing <- towards(flock_center, {gate_center.x - 1, gate_center.y + 3});
+	do perform_herding_movement(target_bearing);
+}
+
+action perform_herding_movement(float target_bearing) {
+	// Position dog on a semi-circle behind the flock (opposite to gate)
+	// Dogs coordinate to spread around the flock based on position_offset
+
+	// Calculate the "back" position (opposite side of flock from gate)
+	float back_bearing <- target_bearing + 180 + position_offset;
+	if (back_bearing > 360) {back_bearing <- back_bearing - 360;}
+
+	// Add the current herding angle to create arc movement
+	float movement_bearing <- back_bearing + herding_angle;
+	if (movement_bearing > 360) {movement_bearing <- movement_bearing - 360;}
+
+	// Calculate target position on the arc
+	target_position <- {
+		flock_center.x + herding_radius * cos(movement_bearing),
+		flock_center.y + herding_radius * sin(movement_bearing)
+	};
+
+	// Move toward this position
+	do move heading: towards(self.location, target_position) speed: dog_speed bounds: pasture_open_polygon;
+
+
+	// Update herding angle for next step
+	if (moving_clockwise) {
+		herding_angle <- herding_angle + angle_increment;
+		if (herding_angle > 90) {
+			moving_clockwise <- false;
+		}
+	} else {
+		herding_angle <- herding_angle - angle_increment;
+		if (herding_angle < -90) {
+			moving_clockwise <- true;
+		}
+	}
+}
+
+// ======== MULTIPLE DOGS =======
+action find_dogs {
+	other_dogs <- ((dogs overlapping (circle(dogs_vision_for_dogs))) - self);
+}
+
+action find_nearest_dog {
+	nearest_dog <- other_dogs with_min_of(distance_to(self.location, each.location));
+}
+//========== MULTIPLE DOGS COORDINATION ======
+reflex coordinate_with_other_dogs {
+	do find_dogs;
+
+	if (not empty(other_dogs)) {
+	// Calculate if dogs should spread out around the flock
+		do find_nearest_dog;
+
+	// If too close to another dog, adjust position
+	if (distance_to(self, nearest_dog) < 20.0) { //wczeniej 20
+		// Move to a complementary position
+		float separation_angle <- towards(self.location, nearest_dog.location) + rnd(45,75); // wczeniej 45,75
+		point separation_target <- {
+		location.x + 15.0 * cos(separation_angle),
+		location.y + 15.0 * sin(separation_angle)
+		};
+		if (separation_target intersects pasture_open_polygon) {
+			do goto target: separation_target speed: dog_speed / 2;
+		}
+	}
+	}
+}
+// ===== DISPLAY ASPECTS =====
+aspect dog {
+draw circle(3) color: #brown;
+	if (target_position != nil) {
+			draw line([location, target_position]) color: #orange width: 1;
+		}
+}
+
+aspect vision_range {
+draw circle(small_dog_vision) color: #red wireframe: true;
+if (flock_center != nil) {
+			draw circle(sheep_vision_for_dog) at: flock_center color: #yellow wireframe: true;
+		}
+}
+}
+
+// ===== GRASS GRID =====
+grid grass cell_width: 1 cell_height: 1 neighbors: 10 {
+	init {
+		if (location overlaps pasture_open_polygon) {
+			color <- rgb(75, 130, 75);
+		}
+		else if (location overlaps fanced_area_polygon) {
+			color <- rgb(90, 80, 50); 
+		}
+	}
+}
+
+
+// ===== EXPERIMENT =====
+experiment simulation type: gui {
+	// User-defined parameters
+	parameter 'Initial number of sheep' var: number_of_sheep;
+	parameter 'Initial number of dogs' var: number_of_dogs;
+	parameter 'Max cohesion turn' var: max_cohere_turn;
+	parameter 'Max alignment turn' var: max_align_turn;
+	parameter 'Max separation turn' var: max_separate_turn;
+	parameter 'Minimal Distance' var: min_separation;
+
+	output {
+		display map {
+			grid grass;
+			species sheep aspect: sheep;
+			species dogs aspect: dog;
+			species dogs aspect: vision_range transparency: 0.7;
+			// species sheep aspect: buffer transparency: 0.9;
+			graphics 'gate'{
+				draw gate_line color: #black;
+				draw gate_entrance color: #black wireframe: true; // Show gate entrance zone
+				draw gate_area color: #yellow wireframe: true;
+			}
+		}
+		display statistics {
+			chart "Sheep Progress" type: series {
+				data "Sheep in fence [%]" value: (sheep_entered_count*100/number_of_sheep) color: #green;
+				data "Sheep remaining [%]" value: ((number_of_sheep - sheep_entered_count)*100/number_of_sheep) color: #red;
+			}
+		}
+		
+		display flock_metrics {
+			chart "Flock Compactness" type: series {
+				data "Average distance from center" value: (length(flock_compactness_history) > 0 ? last(flock_compactness_history) : 0) color: #blue;
+			}
+		}
+	}
+}
+
+
